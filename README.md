@@ -40,6 +40,23 @@ Then open `http://127.0.0.1:3080`.
    mounted into the container), and select it. Sessions run against that
    directory.
 
+### MCP console (dsh-mcp-panel)
+
+The image pre-installs [dsh-mcp-panel](https://github.com/PerryLink/dsh-mcp-panel)
+into the `web` profile — a management console for the official
+`@deepseek-ai/dsh-mcp-client`. It adds a **Settings → Plugins → MCP** tab and a
+`/mcp` command to view, add, edit, and trial-call MCP servers. Open the tab and
+you'll see the MCP server cards immediately.
+
+The bundle is baked into the image at build time and seeded into the `/data`
+volume on first start, so fresh containers need no network or manual steps. An
+existing volume whose `web` profile predates this image is backfilled with
+`dsh plugin --profile web add dsh-mcp-panel` at startup (requires network).
+
+The panel mounts the client for each server you add; the underlying MCP
+servers themselves are configured through the tab, so no `cordis.yml` edits are
+needed.
+
 ## Volumes
 
 | Path          | Purpose                                                        |
@@ -57,6 +74,7 @@ Then open `http://127.0.0.1:3080`.
 | `DSH_PERMISSION_MODE`  | `workspace-write`  | Session permission preset                 |
 | `DSH_TOOLS_MODE`       | `native`           | Tool presentation mode                    |
 | `DSH_TELEMETRY_MODE`   | `DISABLED`         | Telemetry is disabled in this image       |
+| `DSH_MCP_PANEL_VERSION`| `0.6.2`            | dsh-mcp-panel version baked at build time |
 
 ## Security note
 
@@ -91,6 +109,7 @@ docker build --build-arg DSH_VERSION=master -t deepseek-harness .
 [`renovate.json`](renovate.json) opens nightly PRs for:
 
 - `deepseek-ai/deepseek-harness` (via `github-releases`, tags `dsh-v…`)
+- `dsh-mcp-panel` (via `npm`, pinned by the `DSH_MCP_PANEL_VERSION` build arg)
 - `pnpm` (pinned to the upstream `packageManager` field)
 - the `node` base image (default `dockerfile` manager)
 

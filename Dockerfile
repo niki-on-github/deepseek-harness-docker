@@ -51,6 +51,11 @@ FROM node:24-bookworm-slim AS runtime
 
 ARG PNPM_VERSION=11.7.0
 
+# dsh-mcp-panel — MCP management console for the official MCP client. Pre-loaded
+# into a starter web profile (see below) and tracked by Renovate (npm).
+ARG DSH_MCP_PANEL_VERSION=0.6.2
+ENV DSH_MCP_PANEL_VERSION=${DSH_MCP_PANEL_VERSION}
+
 # Runtime system dependencies:
 #   git              - required by the agent for VCS operations
 #   openssh-client   - SSH-based git remotes
@@ -104,6 +109,10 @@ ENV DSH_TOOLS_MODE=native
 # /workspace - mount your project here and select it in the Web UI.
 RUN mkdir -p /workspace /data && chown -R dsh:dsh /workspace /data
 
+# Starter DSH_HOME holding a web profile pre-loaded with dsh-mcp-panel. /data
+# is a volume, so the entrypoint seeds this directory into it on first start.
+RUN mkdir -p /opt/dsh-bootstrap && chown -R dsh:dsh /opt/dsh-bootstrap
+
 COPY entrypoint.sh /usr/local/bin/dsh-entrypoint
 COPY proxy.mjs /app/proxy.mjs
 RUN chmod +x /usr/local/bin/dsh-entrypoint \
@@ -111,6 +120,12 @@ RUN chmod +x /usr/local/bin/dsh-entrypoint \
 
 USER dsh
 WORKDIR /app
+
+# Pre-install dsh-mcp-panel into a starter web profile so the MCP console ships
+# out-of-the-box with no registry access at runtime. Uses the same CLI the proxy
+# launches; DSH_HOME points at the staging dir for this step only.
+RUN DSH_HOME=/opt/dsh-bootstrap \
+    node --import tsx/esm /app/apps/cli/src/bin.ts plugin --profile web add "dsh-mcp-panel@${DSH_MCP_PANEL_VERSION}"
 
 VOLUME ["/data", "/workspace"]
 

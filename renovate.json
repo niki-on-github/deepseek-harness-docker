@@ -35,6 +35,18 @@
       "depNameTemplate": "pnpm",
       "datasourceTemplate": "npm",
       "versioningTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": [
+        "^Dockerfile$"
+      ],
+      "matchStrings": [
+        "ARG DSH_MCP_PANEL_VERSION=(?<currentValue>[\\w.-]+)"
+      ],
+      "depNameTemplate": "dsh-mcp-panel",
+      "datasourceTemplate": "npm",
+      "versioningTemplate": "npm"
     }
   ],
   "packageRules": [
