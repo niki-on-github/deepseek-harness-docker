@@ -1,0 +1,58 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "schedule": [
+    "before 4am"
+  ],
+  "automerge": true,
+  "ignoreTests": true,
+  "platformAutomerge": true,
+  "prHourlyLimit": 99,
+  "prConcurrentLimit": 99,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": [
+        "^Dockerfile$"
+      ],
+      "matchStrings": [
+        "ARG DSH_VERSION=(?<currentValue>[\\w.-]+)"
+      ],
+      "depNameTemplate": "deepseek-ai/deepseek-harness",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^dsh-v(?<version>\\d+\\.\\d+\\.\\d+(?:-[\\w.]+)?)"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": [
+        "^Dockerfile$"
+      ],
+      "matchStrings": [
+        "corepack prepare pnpm@(?<currentValue>\\d+\\.\\d+\\.\\d+) --activate"
+      ],
+      "depNameTemplate": "pnpm",
+      "datasourceTemplate": "npm",
+      "versioningTemplate": "npm"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchPackageNames": [
+        "deepseek-ai/deepseek-harness"
+      ],
+      "extractVersion": "^dsh-v(?<version>\\d+\\.\\d+\\.\\d+(?:-[\\w.]+)?)"
+    },
+    {
+      "matchUpdateTypes": [
+        "major",
+        "minor",
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "automerge": true
+    }
+  ]
+}

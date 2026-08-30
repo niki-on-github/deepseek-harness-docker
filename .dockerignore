@@ -1,0 +1,10 @@
+# The Dockerfile builds from the upstream repo; only the build context files
+# are needed locally.
+*
+!Dockerfile
+!entrypoint.sh
+!proxy.mjs
+!renovate.json
+!README.md
+!LICENSE
+!.github/workflows/container.yaml
