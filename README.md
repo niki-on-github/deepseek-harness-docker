@@ -35,7 +35,12 @@ Then open `http://127.0.0.1:3080`.
 ### First-time setup in the Web UI
 
 1. **Model**: open **Settings → Models**, confirm the `DEEPSEEK_API_KEY` from the
-   environment (or enter another provider's key) and save.
+   environment (or enter another provider's key) and save. To use any
+   OpenAI-compatible endpoint (local server, gateway, another vendor), choose
+   **Add a custom provider** and fill in a lowercase Provider ID, the base URL
+   (e.g. `https://…/v1`), protocol `openai-completions`, an API key, and at
+   least one model ID. This is stored in `/data/.dsh/settings.yaml` under
+   `llm-pi-ai.providers`; the key is referenced by env var name, not inlined.
 2. **Workspace**: click **Choose workspace**, add `/workspace` (the project
    mounted into the container), and select it. Sessions run against that
    directory.
