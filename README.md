@@ -128,5 +128,10 @@ account/org hosting this repository) on every `main` push and `v*` tag. Add a
 ## Caveats
 
 - The project is in developer preview; expect breaking upstream changes.
+- The build applies [`patches/mcp-client-onerror.patch`](patches/mcp-client-onerror.patch):
+  a lost streamable-HTTP MCP session surfaces via `transport.onerror`, not
+  `onclose`, so the client supervisor would otherwise keep a dead generation
+  current and 404 every later call. The patch hooks `onerror` to reconnect and
+  is removed once the fix lands upstream (`git apply` fails loudly on drift).
 - Workspace selection uses the Web UI's directory picker; in a headless
   container this may fall back to the browse variant.

@@ -4,6 +4,8 @@
 !Dockerfile
 !entrypoint.sh
 !proxy.mjs
+!patches/
+!patches/**
 !renovate.json
 !README.md
 !LICENSE
