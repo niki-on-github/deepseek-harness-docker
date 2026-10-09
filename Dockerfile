@@ -41,15 +41,18 @@ RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 WORKDIR /src
 
 # Local compatibility patch: the MCP client's streamable-HTTP session loss
-# surfaces via transport.onerror, never onclose, so the supervisor never learns
-# the generation died. Applied before build; `git apply` fails loudly if a
-# future DSH_VERSION shifts the context. Drop once fixed upstream.
+# surfaces via transport.onerror, never onclose, so the supervisor would keep a
+# dead generation current and 404 every later call. The patch (a) hooks onerror
+# to reconnect, (b) pings an idle connection so a server-side session timer
+# never expires it, and (c) transparently retries a call the server rejects with
+# a lost session. Applied before build; `git apply` fails loudly if a future
+# DSH_VERSION shifts the context. Drop once fixed upstream.
 COPY patches/ /tmp/patches
 
 # Shallow clone of the pinned ref, apply the patch, install with the committed
 # lockfile, then run the full workspace build (lib + client + web frontend).
 RUN git clone --depth 1 --branch "${DSH_VERSION}" "${DSH_REPO}" . \
-    && git apply /tmp/patches/mcp-client-onerror.patch \
+    && git apply /tmp/patches/mcp-client-session-loss.patch \
     && pnpm install --frozen-lockfile \
     && pnpm run build
 

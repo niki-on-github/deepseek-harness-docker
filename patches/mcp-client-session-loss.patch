@@ -1,0 +1,301 @@
+diff --git a/packages/mcp/mcp-client/src/connection.ts b/packages/mcp/mcp-client/src/connection.ts
+index f452e3a..68c5bd0 100644
+--- a/packages/mcp/mcp-client/src/connection.ts
++++ b/packages/mcp/mcp-client/src/connection.ts
+@@ -18,9 +18,10 @@
+ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+ import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js'
+ import type { Context } from '@deepseek-ai/cordis'
++import type { ToolExecution } from '@deepseek-ai/dsh-tools'
+ import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
+ import { createTransport } from './transport.ts'
+-import { syncTools } from './tools.ts'
++import { callToolUncached, syncTools } from './tools.ts'
+ import type { ToolBridgeOptions, ToolDisposers } from './tools.ts'
+ import type { Config } from './index.ts'
+ 
+@@ -49,6 +50,11 @@ export const RECONNECT_DEFAULTS: Required<ReconnectConfig> = Object.freeze({
+ // generation is gone; timing out fails closed instead of overlapping children.
+ const GENERATION_CLOSE_TIMEOUT_MS = 5_000
+ 
++// Bound on one keepalive ping request. A real transport failure still surfaces
++// through the generation's onerror hook; this only stops a hung ping from
++// leaking a pending request forever.
++const KEEP_ALIVE_PING_TIMEOUT_MS = 30_000
++
+ /** Fully resolved reconnect policy captured at plugin load. */
+ export type ResolvedReconnectPolicy = Readonly<Required<ReconnectConfig>>
+ 
+@@ -126,6 +132,7 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
+     registrationFailure: 'contain',
+     serverName: config.serverName,
+     toolCallTimeoutMs: config.toolCallTimeoutMs,
++    ...config.transport === 'streamable-http' ? { invokeTool } : {},
+   }
+   // The initial sync uses 'throw' when failOnStartupError is configured, so
+   // a registration conflict propagates to the startup-await path. Re-syncs
+@@ -142,6 +149,10 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
+   /** Live tool registrations owned by this server; only {@link enqueueSync} and dispose swap it. */
+   let disposers: ToolDisposers = new Map()
+   let reconnectTimer: NodeJS.Timeout | undefined
++  /** Periodic keepalive tick for the live generation; undefined when disabled or down. */
++  let keepAliveTimer: NodeJS.Timeout | undefined
++  /** Callers blocked in {@link awaitClient} until a generation is live again. */
++  const liveWaiters = new Set<() => void>()
+   /** Consecutive failed connection attempts within the current outage. */
+   let failedAttempts = 0
+   /** When the current generation finished connect + initial sync; undefined while down. */
+@@ -172,11 +183,108 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
+   /** One disconnect decision per generation: the isCurrent guard makes racing close/error signals idempotent. */
+   function generationDown(generation: Client): void {
+     if (!isCurrent(generation)) return
++    if (keepAliveTimer !== undefined) {
++      clearInterval(keepAliveTimer)
++      keepAliveTimer = undefined
++    }
+     client = undefined
+     clientClosed = undefined
+     scheduleReconnect()
+   }
+ 
++  /** Wake every caller blocked in {@link awaitClient}; called after a live connect and on disposal. */
++  function notifyLive(): void {
++    const waiters = [...liveWaiters]
++    liveWaiters.clear()
++    for (const wake of waiters) wake()
++  }
++
++  /**
++   * Resolve with the current live client, waiting up to one backoff ceiling for
++   * the supervisor to restore a generation. Bounding the wait keeps a tool call
++   * from hanging when reconnect is disabled or the attempt budget is spent.
++   */
++  function awaitClient(signal: AbortSignal): Promise<Client | undefined> {
++    if (disposed || client !== undefined) return Promise.resolve(client)
++    return new Promise((resolve) => {
++      let settled = false
++      const wake = (): void => {
++        if (settled) return
++        settled = true
++        clearTimeout(timer)
++        signal.removeEventListener('abort', onAbort)
++        liveWaiters.delete(wake)
++        resolve(client)
++      }
++      const onAbort = (): void => {
++        if (settled) return
++        settled = true
++        clearTimeout(timer)
++        liveWaiters.delete(wake)
++        resolve(undefined)
++      }
++      const timer = setTimeout(wake, policy.maxDelayMs)
++      timer.unref()
++      liveWaiters.add(wake)
++      signal.addEventListener('abort', onAbort, { once: true })
++    })
++  }
++
++  /**
++   * Whether an error means the server rejected a stale streamable-HTTP session
++   * before the call executed. The SDK surfaces this as a 404
++   * `StreamableHTTPError`; the message fallback covers an explicit body.
++   */
++  function isSessionLoss(error: unknown): boolean {
++    if ((error as { code?: unknown } | null)?.code === 404) return true
++    const message = error instanceof Error ? error.message : String(error)
++    return /session (?:not found|terminated|expired)|unknown or expired session/i.test(message)
++  }
++
++  /**
++   * Invoke one raw MCP tool against the current live generation. A lost session
++   * is retried exactly once against the reconnected generation; every other
++   * error propagates, so a timeout or JSON-RPC failure is never replayed onto a
++   * tool that may already have executed.
++   */
++  async function invokeTool(
++    rawName: string,
++    args: Record<string, unknown>,
++    exec: ToolExecution,
++  ): Promise<Record<string, unknown>> {
++    const active = await awaitClient(exec.signal)
++    if (active === undefined) throw new Error(`${label}: no live connection to call tool "${rawName}"`)
++    try {
++      return await callToolUncached(active, rawName, args, exec, opts)
++    } catch (error) {
++      // A 404 proves the server rejected the request before running it, so the
++      // replay cannot double-execute the tool.
++      if (!policy.enabled || !isSessionLoss(error)) throw error
++      generationDown(active)
++      const reconnected = await awaitClient(exec.signal)
++      if (reconnected === undefined || reconnected === active) throw error
++      ctx.logger.warn(`${label}: session lost; reconnected and retrying tool call "${rawName}" once`)
++      return await callToolUncached(reconnected, rawName, args, exec, opts)
++    }
++  }
++
++  /** Arm the idle keepalive for one connected generation; a no-op when disabled. */
++  function armKeepAlive(generation: Client): void {
++    const intervalMs = config.keepAliveIntervalMs
++    if (intervalMs === undefined || !Number.isFinite(intervalMs) || intervalMs <= 0) return
++    if (keepAliveTimer !== undefined) clearInterval(keepAliveTimer)
++    keepAliveTimer = setInterval(() => {
++      if (!isCurrent(generation)) return
++      // ping is a normal request carrying the session id, so it refreshes the
++      // server's idle timer. A JSON-RPC error still reached the server and only
++      // transport failures surface through the generation's onerror hook.
++      void generation.ping({ timeout: KEEP_ALIVE_PING_TIMEOUT_MS }).catch((error: unknown) => {
++        ctx.logger.debug(`${label}: keepalive ping failed: ${String(error)}`)
++      })
++    }, intervalMs)
++    keepAliveTimer.unref()
++  }
++
+   /** Wait for the transport-owned close signal without letting a broken transport wedge teardown forever. */
+   function waitForClose(closed: Promise<void>): Promise<boolean> {
+     return new Promise((resolve) => {
+@@ -301,6 +409,8 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
+     }
+     if (!isCurrent(generation)) return
+     connectedAt = Date.now()
++    armKeepAlive(generation)
++    notifyLive()
+     if (failedAttempts > 0) ctx.logger.info(`${label}: reconnected and re-synced tools (attempt ${failedAttempts}/${policy.maxAttempts})`)
+   }
+ 
+@@ -330,6 +440,10 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
+         clearTimeout(reconnectTimer)
+         reconnectTimer = undefined
+       }
++      if (keepAliveTimer !== undefined) {
++        clearInterval(keepAliveTimer)
++        keepAliveTimer = undefined
++      }
+       const current = client
+       const currentClosed = clientClosed
+       client = undefined
+@@ -346,6 +460,7 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
+       await syncChain
+       for (const dispose of disposers.values()) dispose()
+       disposers = new Map()
++      notifyLive()
+     },
+   }
+ }
+diff --git a/packages/mcp/mcp-client/src/index.ts b/packages/mcp/mcp-client/src/index.ts
+index 59ef928..87c63b5 100644
+--- a/packages/mcp/mcp-client/src/index.ts
++++ b/packages/mcp/mcp-client/src/index.ts
+@@ -34,6 +34,13 @@ export const inject = ['tools']
+ /** Default timeout for individual MCP tool calls (ms). */
+ const DEFAULT_TOOL_CALL_TIMEOUT_MS = 60_000
+ 
++/**
++ * Default interval (ms) between keepalive pings on an established connection.
++ * Every request — including a ping — refreshes an idle server-side session, so
++ * this stays well under typical session TTLs (e.g. ToolHive vMCP's 30 minutes).
++ */
++const DEFAULT_KEEP_ALIVE_INTERVAL_MS = 600_000
++
+ /** Valid `serverName`, kept below the public tool-name budget. */
+ const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
+ 
+@@ -66,6 +73,12 @@ export interface StdioConfig {
+   cwd: string
+   /** Per-tool-call timeout in milliseconds. */
+   toolCallTimeoutMs: number
++  /**
++   * Interval in milliseconds between keepalive pings on an established
++   * connection; a ping is an ordinary request, so it refreshes a server-side
++   * idle session. `0` disables it (default 600000).
++   */
++  keepAliveIntervalMs?: number
+   /** Fail plugin activation when the initial connection or tool synchronization fails. */
+   failOnStartupError: boolean
+   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
+@@ -88,6 +101,12 @@ export interface StreamableHttpConfig {
+   headers: Record<string, string>
+   /** Per-tool-call timeout in milliseconds. */
+   toolCallTimeoutMs: number
++  /**
++   * Interval in milliseconds between keepalive pings on an established
++   * connection; a ping is an ordinary request, so it refreshes a server-side
++   * idle session. `0` disables it (default 600000).
++   */
++  keepAliveIntervalMs?: number
+   /** Fail plugin activation when the initial connection or tool synchronization fails. */
+   failOnStartupError: boolean
+   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
+@@ -119,6 +138,7 @@ export const Config = z.union([
+     env: z.dict(String).default({}),
+     cwd: z.string().default(''),
+     toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
++    keepAliveIntervalMs: z.number().min(0).default(DEFAULT_KEEP_ALIVE_INTERVAL_MS),
+     failOnStartupError: z.boolean().default(false),
+     reconnect: Reconnect,
+   }),
+@@ -128,6 +148,7 @@ export const Config = z.union([
+     url: z.string().required(),
+     headers: z.dict(String).default({}),
+     toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
++    keepAliveIntervalMs: z.number().min(0).default(DEFAULT_KEEP_ALIVE_INTERVAL_MS),
+     failOnStartupError: z.boolean().default(false),
+     reconnect: Reconnect,
+   }),
+diff --git a/packages/mcp/mcp-client/src/tools.ts b/packages/mcp/mcp-client/src/tools.ts
+index 4c6ab40..c1e9b8e 100644
+--- a/packages/mcp/mcp-client/src/tools.ts
++++ b/packages/mcp/mcp-client/src/tools.ts
+@@ -25,12 +25,25 @@ import type { ToolDefinition, ToolExecution, ToolExecutionResult } from '@deepse
+ import { assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
+ import type { JsonSchemaNode, JsonValue } from '@deepseek-ai/dsh-tools'
+ 
++/**
++ * Supervisor hook for invoking one raw MCP tool against the current live
++ * generation. The connection owner injects this so it can transparently retry
++ * a call that the server rejected with a lost session.
++ */
++export type InvokeTool = (
++  rawName: string,
++  args: Record<string, unknown>,
++  exec: ToolExecution,
++) => ReturnType<typeof callToolUncached>
++
+ /** Resolved options relevant to tool bridging. */
+ export interface ToolBridgeOptions {
+   /** Whether a registry conflict is contained or rejects this synchronization. */
+   registrationFailure: 'contain' | 'throw'
+   serverName: string
+   toolCallTimeoutMs: number
++  /** Override for the raw call path; omission calls the generation's client directly. */
++  invokeTool?: InvokeTool
+ }
+ 
+ /** State for one sync generation: the current set of disposers keyed by public name. */
+@@ -77,7 +90,7 @@ function listToolsUncached(client: Client, cursor?: string) {
+ }
+ 
+ /** Call without the SDK pre-validating an output schema the bridge may not support. */
+-function callToolUncached(
++export function callToolUncached(
+   client: Client,
+   rawName: string,
+   args: Record<string, unknown>,
+@@ -308,6 +321,8 @@ function createExecutor(
+   opts: ToolBridgeOptions,
+   projections: WeakMap<ToolExecution, PreparedProjection>,
+ ): ToolDefinition['execute'] {
++  const invoke: InvokeTool = opts.invokeTool ?? ((rawName, args, exec) =>
++    callToolUncached(client, rawName, args, exec, opts))
+   return async (args: unknown, exec: ToolExecution) => {
+     if (taskRequired) {
+       throw new Error(`Tool "${rawName}" requires task-based execution, which this bridge does not support`)
+@@ -317,7 +332,7 @@ function createExecutor(
+     // string/number/null). Fallback to {} lets the MCP server produce a
+     // specific "missing required param" error the model can learn from.
+     const argsObj = (typeof args === 'object' && args !== null ? args : {}) as Record<string, unknown>
+-    const result = await callToolUncached(client, rawName, argsObj, exec, opts)
++    const result = await invoke(rawName, argsObj, exec)
+ 
+     // The SDK may return a legacy `toolResult` shape; normalize to content array.
+     if (!Array.isArray(result.content)) {

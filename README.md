@@ -128,10 +128,21 @@ account/org hosting this repository) on every `main` push and `v*` tag. Add a
 ## Caveats
 
 - The project is in developer preview; expect breaking upstream changes.
-- The build applies [`patches/mcp-client-onerror.patch`](patches/mcp-client-onerror.patch):
-  a lost streamable-HTTP MCP session surfaces via `transport.onerror`, not
-  `onclose`, so the client supervisor would otherwise keep a dead generation
-  current and 404 every later call. The patch hooks `onerror` to reconnect and
-  is removed once the fix lands upstream (`git apply` fails loudly on drift).
+- The build applies
+  [`patches/mcp-client-session-loss.patch`](patches/mcp-client-session-loss.patch):
+  a lost streamable-HTTP MCP session has three failure modes the upstream client
+  doesn't handle, and this patch addresses all three.
+  1. The loss surfaces via `transport.onerror`, not `onclose`, so the client
+     supervisor would otherwise keep a dead generation current and 404 every
+     later call; the patch hooks `onerror` to reconnect.
+  2. A server that expires idle sessions (e.g. ToolHive vMCP's 30-minute TTL)
+     drops the client because nothing refreshes it; the patch pings each
+     established connection every `keepAliveIntervalMs` (default 600000, set
+     `0` to disable), which is an ordinary request and resets the server timer.
+  3. If a call still hits a lost session (pod restart, missed ping), the patch
+     retries it once against the reconnected generation instead of surfacing a
+     404 to the model. Only a `404`/session-loss error is retried — a timeout is
+     never replayed, so non-idempotent tools can't double-execute.
+  It is removed once the fixes land upstream (`git apply` fails loudly on drift).
 - Workspace selection uses the Web UI's directory picker; in a headless
   container this may fall back to the browse variant.
